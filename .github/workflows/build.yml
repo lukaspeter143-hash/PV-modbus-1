@@ -20,3 +20,1502 @@ jobs:
       - name: Projekt anlegen
         run: |
           mkdir -p proj/app/src/main/java/de/pvmodbus/app
+          cat > proj/settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "PvModbus"
+          include(":app")
+          EOF
+          cat > proj/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > proj/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+          cat > proj/app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "de.pvmodbus.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "de.pvmodbus.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.animation:animation")
+              implementation("androidx.activity:activity-compose:1.9.0")
+          }
+          EOF
+          cat > proj/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:label="PV Monitor"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          cat > proj/app/src/main/java/de/pvmodbus/app/Profile.kt <<'EOF'
+          package de.pvmodbus.app
+
+          enum class Profile(
+              val short: String,
+              val title: String,
+              val defUnit: String,
+              val defPort: String,
+              val hint: String
+          ) {
+              SUNSPEC(
+                  "SunSpec", "SunSpec – Fronius, SolarEdge, Kaco, Kostal u. a.", "1", "502",
+                  "Liest automatisch alle Datenblöcke. Fronius: Port 502, Unit-ID 1 = Wechselrichter, 200 = Smart Meter (z. B. \"1,200\"). SolarEdge: Port 1502. Kostal Plenticore: meist Port 1502, Unit-ID 71. SunSpec/Modbus TCP muss im Gerät aktiviert sein."
+              ),
+              HUAWEI(
+                  "Huawei", "Huawei SUN2000", "0", "502",
+                  "Modbus TCP im Dongle bzw. Wechselrichter aktivieren. Port 502 (Dongle) oder 6607 (direkt am Wechselrichter-WLAN), Unit-ID 0 oder 1."
+              ),
+              GOODWE(
+                  "GoodWe", "GoodWe ET/EH/BT/BH (Hybrid)", "247", "502",
+                  "Modbus TCP gibt es nur mit dem neueren WLAN/LAN-Dongle (WLA0000-01-00P). Port 502, Unit-ID 247. Die Serien DT, XS und ES haben eine andere Registerbelegung und sind noch nicht enthalten."
+              ),
+              MANUAL(
+                  "Manuell", "Manuell – beliebiges Register", "1", "502",
+                  "Liest ein einzelnes Register eines beliebigen Modbus-TCP-Geräts. Adresse laut Herstellerdokument (0-basiert)."
+              );
+
+              companion object {
+                  fun fromName(n: String): Profile = values().firstOrNull { it.name == n } ?: SUNSPEC
+              }
+          }
+          EOF
+          cat > proj/app/src/main/java/de/pvmodbus/app/Format.kt <<'EOF'
+          package de.pvmodbus.app
+
+          import java.util.Locale
+
+          fun fmtNum(v: Double): String {
+              if (v.isNaN() || v.isInfinite()) return "–"
+              val s = if (v == Math.rint(v) && Math.abs(v) < 1e12) {
+                  String.format(Locale.US, "%.0f", v)
+              } else {
+                  String.format(Locale.US, "%.3f", v).trimEnd('0').trimEnd('.')
+              }
+              return s.replace('.', ',')
+          }
+
+          data class Reading(val key: String, val label: String, val text: String, val num: Double?)
+
+          data class Section(val id: String, val title: String, val rows: List<Reading>)
+          EOF
+          cat > proj/app/src/main/java/de/pvmodbus/app/ModbusConnection.kt <<'EOF'
+          package de.pvmodbus.app
+
+          import java.io.Closeable
+          import java.io.DataInputStream
+          import java.io.IOException
+          import java.io.OutputStream
+          import java.net.InetSocketAddress
+          import java.net.Socket
+          import java.nio.ByteBuffer
+
+          private fun modbusErrorText(code: Int): String = when (code) {
+              1 -> "Funktion nicht unterstützt"
+              2 -> "Adresse nicht vorhanden"
+              3 -> "Ungültiger Wert oder Anzahl"
+              4 -> "Gerätefehler"
+              6 -> "Gerät beschäftigt"
+              11 -> "Gerät antwortet nicht"
+              else -> "unbekannt"
+          }
+
+          /** Das Gerät hat mit einem Modbus-Fehlercode geantwortet (Verbindung bleibt nutzbar). */
+          class ModbusException(val code: Int) : IOException("Modbus-Fehler $code (" + modbusErrorText(code) + ")")
+
+          /** Eine offene Modbus-TCP-Verbindung, mehrere Abfragen nacheinander möglich. */
+          class ModbusConnection(host: String, port: Int, timeoutMs: Int = 4000) : Closeable {
+              private val socket = Socket()
+              private val input: DataInputStream
+              private val output: OutputStream
+              private var tid = 0
+
+              init {
+                  try {
+                      socket.connect(InetSocketAddress(host, port), timeoutMs)
+                      socket.soTimeout = timeoutMs
+                  } catch (e: IOException) {
+                      try { socket.close() } catch (x: Exception) { }
+                      throw e
+                  }
+                  input = DataInputStream(socket.getInputStream())
+                  output = socket.getOutputStream()
+              }
+
+              /** function: 3 = Holding Register, 4 = Input Register */
+              fun read(unit: Int, function: Int, address: Int, count: Int): IntArray {
+                  tid = (tid + 1) and 0xFFFF
+                  val req = ByteBuffer.allocate(12)
+                  req.putShort(tid.toShort())
+                  req.putShort(0)
+                  req.putShort(6)
+                  req.put(unit.toByte())
+                  req.put(function.toByte())
+                  req.putShort(address.toShort())
+                  req.putShort(count.toShort())
+                  output.write(req.array())
+                  output.flush()
+
+                  val header = ByteArray(7)
+                  input.readFully(header)
+                  val respTid = ((header[0].toInt() and 0xFF) shl 8) or (header[1].toInt() and 0xFF)
+                  val length = ((header[4].toInt() and 0xFF) shl 8) or (header[5].toInt() and 0xFF)
+                  if (respTid != tid || length < 2) throw IOException("Ungültige Antwort vom Gerät")
+                  val pdu = ByteArray(length - 1)
+                  input.readFully(pdu)
+
+                  val fc = pdu[0].toInt() and 0xFF
+                  if (fc and 0x80 != 0) throw ModbusException(pdu[1].toInt() and 0xFF)
+                  val byteCount = pdu[1].toInt() and 0xFF
+                  return IntArray(byteCount / 2) { i ->
+                      ((pdu[2 + i * 2].toInt() and 0xFF) shl 8) or (pdu[3 + i * 2].toInt() and 0xFF)
+                  }
+              }
+
+              fun readChunked(unit: Int, function: Int, address: Int, count: Int, chunk: Int = 100): IntArray {
+                  val out = IntArray(count)
+                  var done = 0
+                  while (done < count) {
+                      val n = minOf(chunk, count - done)
+                      val part = read(unit, function, address + done, n)
+                      if (part.size < n) throw IOException("Antwort zu kurz")
+                      System.arraycopy(part, 0, out, done, n)
+                      done += n
+                  }
+                  return out
+              }
+
+              override fun close() {
+                  try { socket.close() } catch (e: Exception) { }
+              }
+          }
+          EOF
+          cat > proj/app/src/main/java/de/pvmodbus/app/SunSpec.kt <<'EOF'
+          package de.pvmodbus.app
+
+          import android.content.Context
+          import org.json.JSONObject
+
+          /**
+           * Liest ALLE SunSpec-Datenblöcke eines Geräts. Die Beschreibung jedes Blocks (Namen, Einheiten,
+           * Skalierung, Aufzählungen) kommt aus den offiziellen SunSpec-Modelldateien in assets/models.
+           */
+          class SunSpecReader(private val context: Context) {
+              private val cache = HashMap<Int, JSONObject?>()
+
+              private fun model(id: Int): JSONObject? {
+                  if (cache.containsKey(id)) return cache[id]
+                  val def: JSONObject? = try {
+                      context.assets.open("models/model_$id.json").bufferedReader().use { JSONObject(it.readText()) }
+                  } catch (e: Exception) {
+                      null
+                  }
+                  cache[id] = def
+                  return def
+              }
+
+              fun readAll(conn: ModbusConnection, unit: Int): List<Section> {
+                  val sections = ArrayList<Section>()
+                  var found = -1
+                  for (b in intArrayOf(40000, 0, 50000)) {
+                      try {
+                          val h = conn.read(unit, 3, b, 2)
+                          if (h.size >= 2 && h[0] == 0x5375 && h[1] == 0x6E53) {   // "SunS"
+                              found = b
+                              break
+                          }
+                      } catch (e: ModbusException) {
+                          // nächste Startadresse probieren
+                      }
+                  }
+                  if (found < 0) {
+                      throw IllegalStateException("Unit $unit: keine SunSpec-Kennung gefunden (Modbus/SunSpec im Gerät aktiviert? Unit-ID richtig?)")
+                  }
+
+                  var addr = found + 2
+                  var guard = 0
+                  while (guard < 80) {
+                      guard++
+                      val hd: IntArray = try {
+                          conn.read(unit, 3, addr, 2)
+                      } catch (e: ModbusException) {
+                          break
+                      }
+                      if (hd.size < 2) break
+                      val id = hd[0]
+                      val len = hd[1]
+                      if (id == 0xFFFF || id == 0 || len == 0) break
+                      val data: IntArray? = try {
+                          conn.readChunked(unit, 3, addr, len + 2)
+                      } catch (e: ModbusException) {
+                          null
+                      }
+                      if (data != null) sections.add(decodeModel(id, data, unit))
+                      addr += len + 2
+                  }
+                  if (sections.isEmpty()) throw IllegalStateException("Unit $unit: keine Datenblöcke gefunden")
+                  return sections
+              }
+
+              private fun decodeModel(id: Int, r: IntArray, unit: Int): Section {
+                  val prefix = "Gerät $unit · "
+                  val def = model(id)
+                  if (def == null) {
+                      val info = Reading("", "Rohdaten", "${r.size - 2} Register (keine Beschreibung vorhanden)", null)
+                      return Section(id.toString(), prefix + "Modell $id", listOf(info))
+                  }
+                  val group = def.getJSONObject("group")
+                  val title = group.optString("label", "").ifEmpty { group.optString("name", "Modell $id") }
+                  val rows = ArrayList<Reading>()
+                  decodeGroup(group, r, 0, HashMap<String, Long>(), rows, "")
+                  return Section(id.toString(), prefix + title, rows)
+              }
+
+              private fun defaultSize(type: String): Int = when (type) {
+                  "int32", "uint32", "acc32", "enum32", "bitfield32", "float32", "ipaddr" -> 2
+                  "int64", "uint64", "acc64", "float64", "eui48" -> 4
+                  "ipv6addr" -> 8
+                  else -> 1
+              }
+
+              private fun resolveCount(g: JSONObject, vals: Map<String, Long>, remaining: Int): Int {
+                  val c = g.opt("count")
+                  var n = 1
+                  if (c is Int) {
+                      if (c > 0) {
+                          n = c
+                      } else {
+                          var size = 0
+                          val pts = g.optJSONArray("points")
+                          if (pts != null) {
+                              for (i in 0 until pts.length()) {
+                                  val p = pts.getJSONObject(i)
+                                  size += p.optInt("size", defaultSize(p.optString("type", "uint16")))
+                              }
+                          }
+                          n = if (size > 0) remaining / size else 0
+                      }
+                  } else if (c is String) {
+                      val v = vals[c]
+                      n = if (v != null) v.toInt() else 0
+                  }
+                  return if (n < 0) 0 else if (n > 64) 64 else n
+              }
+
+              private fun decodeGroup(
+                  g: JSONObject, r: IntArray, start: Int,
+                  parentVals: Map<String, Long>, rows: MutableList<Reading>, prefix: String
+              ): Int {
+                  val vals = HashMap<String, Long>(parentVals)
+                  var off = start
+                  val points = g.optJSONArray("points")
+                  if (points != null) {
+                      for (i in 0 until points.length()) {
+                          val p = points.getJSONObject(i)
+                          val type = p.optString("type", "uint16")
+                          val name = p.optString("name", "")
+                          val size = p.optInt("size", defaultSize(type))
+                          if (off + size > r.size) return r.size
+                          if (type != "pad" && name != "ID" && name != "L") {
+                              val row = decodePoint(p, type, name, size, r, off, vals, prefix)
+                              if (row != null) rows.add(row)
+                          }
+                          off += size
+                      }
+                  }
+                  val subs = g.optJSONArray("groups")
+                  if (subs != null) {
+                      for (i in 0 until subs.length()) {
+                          val sg = subs.getJSONObject(i)
+                          val sgName = sg.optString("name", "group")
+                          val cnt = resolveCount(sg, vals, r.size - off)
+                          for (k in 1..cnt) {
+                              if (off >= r.size) break
+                              val p2 = if (cnt > 1) "$prefix$sgName $k · " else "$prefix$sgName · "
+                              off = decodeGroup(sg, r, off, vals, rows, p2)
+                          }
+                      }
+                  }
+                  return off
+              }
+
+              private fun decodePoint(
+                  p: JSONObject, type: String, name: String, size: Int, r: IntArray, off: Int,
+                  vals: HashMap<String, Long>, prefix: String
+              ): Reading? {
+                  val label = prefix + p.optString("label", "").ifEmpty { name }
+                  val units = p.optString("units", "")
+                  val symbols = p.optJSONArray("symbols")
+
+                  var raw = 0L
+                  var na = false
+                  var dbl = Double.NaN
+                  var numeric = true
+                  when (type) {
+                      "int16", "sunssf" -> {
+                          raw = r[off].toShort().toLong()
+                          na = r[off] == 0x8000
+                      }
+                      "uint16", "count", "enum16" -> {
+                          raw = r[off].toLong()
+                          na = r[off] == 0xFFFF
+                      }
+                      "acc16", "bitfield16" -> {
+                          raw = r[off].toLong()
+                      }
+                      "int32" -> {
+                          val v = (r[off].toLong() shl 16) or r[off + 1].toLong()
+                          raw = v.toInt().toLong()
+                          na = v == 0x80000000L
+                      }
+                      "uint32", "enum32" -> {
+                          val v = (r[off].toLong() shl 16) or r[off + 1].toLong()
+                          raw = v
+                          na = v == 0xFFFFFFFFL
+                      }
+                      "acc32", "bitfield32" -> {
+                          raw = (r[off].toLong() shl 16) or r[off + 1].toLong()
+                      }
+                      "int64", "uint64", "acc64" -> {
+                          var v = 0L
+                          for (k in 0 until 4) v = (v shl 16) or r[off + k].toLong()
+                          raw = v
+                          na = (type == "int64" && v == Long.MIN_VALUE) || (type == "uint64" && v == -1L)
+                      }
+                      "float32" -> {
+                          dbl = java.lang.Float.intBitsToFloat((r[off] shl 16) or r[off + 1]).toDouble()
+                          na = dbl.isNaN()
+                      }
+                      "float64" -> {
+                          var v = 0L
+                          for (k in 0 until 4) v = (v shl 16) or r[off + k].toLong()
+                          dbl = java.lang.Double.longBitsToDouble(v)
+                          na = dbl.isNaN()
+                      }
+                      else -> numeric = false
+                  }
+
+                  if (numeric && type != "float32" && type != "float64" && name.isNotEmpty()) vals[name] = raw
+                  if (type == "sunssf") return null
+
+                  if (type == "string") {
+                      val sb = StringBuilder()
+                      for (k in 0 until size) {
+                          val w = r[off + k]
+                          val a = (w shr 8) and 0xFF
+                          val b = w and 0xFF
+                          if (a != 0) sb.append(a.toChar())
+                          if (b != 0) sb.append(b.toChar())
+                      }
+                      val s = sb.toString().trim()
+                      return Reading(name, label, if (s.isEmpty()) "–" else s, null)
+                  }
+
+                  if (!numeric) {
+                      val hex = (0 until size).joinToString("") { String.format("%04X", r[off + it]) }
+                      return Reading(name, label, hex, null)
+                  }
+
+                  if (type.startsWith("enum")) {
+                      var nm: String? = null
+                      if (symbols != null) {
+                          for (k in 0 until symbols.length()) {
+                              val sy = symbols.getJSONObject(k)
+                              if (sy.optLong("value", -1L) == raw) {
+                                  nm = sy.optString("name")
+                                  break
+                              }
+                          }
+                      }
+                      val t = if (na) "–" else if (nm != null) "$nm ($raw)" else raw.toString()
+                      return Reading(name, label, t, if (na) null else raw.toDouble())
+                  }
+
+                  if (type.startsWith("bitfield")) {
+                      val names = ArrayList<String>()
+                      if (symbols != null) {
+                          for (k in 0 until symbols.length()) {
+                              val sy = symbols.getJSONObject(k)
+                              val bit = sy.optInt("value", -1)
+                              if (bit in 0..63 && ((raw shr bit) and 1L) == 1L) names.add(sy.optString("name"))
+                          }
+                      }
+                      val hex = String.format("0x%X", raw)
+                      val t = if (names.isEmpty()) hex else hex + " (" + names.joinToString(", ") + ")"
+                      return Reading(name, label, t, raw.toDouble())
+                  }
+
+                  if (na) return Reading(name, label, "–", null)
+
+                  var value = if (type == "float32" || type == "float64") dbl else raw.toDouble()
+                  val sfAny = p.opt("sf")
+                  var sf = 0
+                  if (sfAny is String) {
+                      val s = vals[sfAny]
+                      if (s != null && s != -32768L) sf = s.toInt()
+                  } else if (sfAny is Int) {
+                      sf = sfAny
+                  }
+                  if (sf != 0) value *= Math.pow(10.0, sf.toDouble())
+
+                  val txt = fmtNum(value) + (if (units.isNotEmpty()) " $units" else "")
+                  return Reading(name, label, txt, value)
+              }
+          }
+          EOF
+          cat > proj/app/src/main/java/de/pvmodbus/app/RegisterReader.kt <<'EOF'
+          package de.pvmodbus.app
+
+          /** Beschreibung eines einzelnen Registers (für Hersteller ohne SunSpec). */
+          data class RegDef(
+              val key: String,
+              val label: String,
+              val addr: Int,
+              val type: String,          // U16, I16, U32, I32, F32, H16, STR
+              val scale: Double = 1.0,
+              val unit: String = "",
+              val len: Int = 0           // nur für STR: Anzahl Register
+          )
+
+          object RegisterReader {
+              private fun regCount(d: RegDef): Int = when (d.type) {
+                  "U32", "I32", "F32" -> 2
+                  "STR" -> d.len
+                  else -> 1
+              }
+
+              private fun w32(r: IntArray, off: Int, swap: Boolean): Long {
+                  val a = if (swap) r[off + 1] else r[off]
+                  val b = if (swap) r[off] else r[off + 1]
+                  return (a.toLong() shl 16) or b.toLong()
+              }
+
+              private fun decode(d: RegDef, r: IntArray, off: Int, swap: Boolean): Reading {
+                  val n = regCount(d)
+                  if (n <= 0 || off < 0 || off + n > r.size) return Reading(d.key, d.label, "n/v", null)
+                  if (d.type == "STR") {
+                      val sb = StringBuilder()
+                      for (k in 0 until n) {
+                          val w = r[off + k]
+                          val a = (w shr 8) and 0xFF
+                          val b = w and 0xFF
+                          if (a != 0) sb.append(a.toChar())
+                          if (b != 0) sb.append(b.toChar())
+                      }
+                      val s = sb.toString().trim()
+                      return Reading(d.key, d.label, if (s.isEmpty()) "–" else s, null)
+                  }
+                  if (d.type == "H16") {
+                      return Reading(d.key, d.label, String.format("0x%04X", r[off]), r[off].toDouble())
+                  }
+                  val v: Double = when (d.type) {
+                      "U16" -> r[off].toDouble()
+                      "I16" -> r[off].toShort().toDouble()
+                      "U32" -> (w32(r, off, swap) and 0xFFFFFFFFL).toDouble()
+                      "I32" -> w32(r, off, swap).toInt().toDouble()
+                      "F32" -> java.lang.Float.intBitsToFloat(w32(r, off, swap).toInt()).toDouble()
+                      else -> Double.NaN
+                  }
+                  val value = v * d.scale
+                  val txt = fmtNum(value) + (if (d.unit.isNotEmpty() && !value.isNaN()) " " + d.unit else "")
+                  return Reading(d.key, d.label, txt, value)
+              }
+
+              /** Liest alle Register; benachbarte werden zu einer Abfrage zusammengefasst. */
+              fun readDefs(
+                  conn: ModbusConnection, unit: Int, function: Int,
+                  defs: List<RegDef>, swap: Boolean = false
+              ): List<Reading> {
+                  val sorted = defs.sortedBy { it.addr }
+                  val result = HashMap<String, Reading>()
+                  var i = 0
+                  while (i < sorted.size) {
+                      val start = sorted[i].addr
+                      var end = start + regCount(sorted[i])
+                      var j = i + 1
+                      while (j < sorted.size &&
+                          sorted[j].addr + regCount(sorted[j]) - start <= 100 &&
+                          sorted[j].addr - end <= 16
+                      ) {
+                          end = maxOf(end, sorted[j].addr + regCount(sorted[j]))
+                          j++
+                      }
+                      val data: IntArray? = try {
+                          conn.read(unit, function, start, end - start)
+                      } catch (e: ModbusException) {
+                          null
+                      }
+                      for (k in i until j) {
+                          val d = sorted[k]
+                          if (data != null) {
+                              result[d.key] = decode(d, data, d.addr - start, swap)
+                          } else {
+                              try {
+                                  val one = conn.read(unit, function, d.addr, regCount(d))
+                                  result[d.key] = decode(d, one, 0, swap)
+                              } catch (e: ModbusException) {
+                                  result[d.key] = Reading(d.key, d.label, "n/v", null)
+                              }
+                          }
+                      }
+                      i = j
+                  }
+                  return defs.map { result[it.key] ?: Reading(it.key, it.label, "n/v", null) }
+              }
+          }
+
+          object HuaweiProfile {
+              private val defs = listOf(
+                  RegDef("model", "Modell", 30000, "STR", len = 15),
+                  RegDef("sn", "Seriennummer", 30015, "STR", len = 10),
+                  RegDef("pv1_v", "PV1 Spannung", 32016, "I16", 0.1, "V"),
+                  RegDef("pv1_i", "PV1 Strom", 32017, "I16", 0.01, "A"),
+                  RegDef("pv2_v", "PV2 Spannung", 32018, "I16", 0.1, "V"),
+                  RegDef("pv2_i", "PV2 Strom", 32019, "I16", 0.01, "A"),
+                  RegDef("pv3_v", "PV3 Spannung", 32020, "I16", 0.1, "V"),
+                  RegDef("pv3_i", "PV3 Strom", 32021, "I16", 0.01, "A"),
+                  RegDef("pv4_v", "PV4 Spannung", 32022, "I16", 0.1, "V"),
+                  RegDef("pv4_i", "PV4 Strom", 32023, "I16", 0.01, "A"),
+                  RegDef("dc_power", "DC-Eingangsleistung", 32064, "I32", 1.0, "W"),
+                  RegDef("uab", "Netzspannung L1-L2", 32066, "U16", 0.1, "V"),
+                  RegDef("ubc", "Netzspannung L2-L3", 32067, "U16", 0.1, "V"),
+                  RegDef("uca", "Netzspannung L3-L1", 32068, "U16", 0.1, "V"),
+                  RegDef("ua", "Spannung Phase L1", 32069, "U16", 0.1, "V"),
+                  RegDef("ub", "Spannung Phase L2", 32070, "U16", 0.1, "V"),
+                  RegDef("uc", "Spannung Phase L3", 32071, "U16", 0.1, "V"),
+                  RegDef("ia", "Strom Phase L1", 32072, "I32", 0.001, "A"),
+                  RegDef("ib", "Strom Phase L2", 32074, "I32", 0.001, "A"),
+                  RegDef("ic", "Strom Phase L3", 32076, "I32", 0.001, "A"),
+                  RegDef("peak_today", "Spitzenleistung heute", 32078, "I32", 1.0, "W"),
+                  RegDef("P", "Wirkleistung (AC)", 32080, "I32", 1.0, "W"),
+                  RegDef("Q", "Blindleistung", 32082, "I32", 1.0, "var"),
+                  RegDef("pf", "Leistungsfaktor", 32084, "I16", 0.001),
+                  RegDef("f", "Netzfrequenz", 32085, "U16", 0.01, "Hz"),
+                  RegDef("eff", "Wirkungsgrad", 32086, "U16", 0.01, "%"),
+                  RegDef("temp", "Gerätetemperatur", 32087, "I16", 0.1, "°C"),
+                  RegDef("iso", "Isolationswiderstand", 32088, "U16", 0.001, "MΩ"),
+                  RegDef("St", "Gerätestatus", 32089, "H16"),
+                  RegDef("fault", "Fehlercode", 32090, "U16"),
+                  RegDef("E_total", "Gesamtertrag", 32106, "U32", 0.01, "kWh"),
+                  RegDef("E_day", "Tagesertrag", 32114, "U32", 0.01, "kWh"),
+                  RegDef("bat_status", "Batterie Status (falls vorhanden)", 37000, "U16"),
+                  RegDef("bat_P", "Batterie Lade-/Entladeleistung (+ = laden)", 37001, "I32", 1.0, "W"),
+                  RegDef("SOC", "Batterie Ladestand", 37004, "U16", 0.1, "%"),
+                  RegDef("meter_P", "Zähler Wirkleistung (falls vorhanden)", 37113, "I32", 1.0, "W")
+              )
+
+              private fun statusText(code: Int): String = when (code) {
+                  0x0000 -> "Standby: Initialisierung"
+                  0x0001 -> "Standby: Isolationsprüfung"
+                  0x0002 -> "Standby: Einstrahlungserkennung"
+                  0x0003 -> "Standby: Netzprüfung"
+                  0x0100 -> "Startet"
+                  0x0200 -> "Netzbetrieb"
+                  0x0201 -> "Netzbetrieb: Leistung begrenzt"
+                  0x0202 -> "Netzbetrieb: Selbstbegrenzung"
+                  0x0300 -> "Abschaltung: Fehler"
+                  0x0301 -> "Abschaltung: Befehl"
+                  0x0308 -> "Abschaltung: zu wenig Eingangsleistung"
+                  0xA000 -> "Standby: keine Einstrahlung"
+                  else -> String.format("Status 0x%04X", code)
+              }
+
+              fun read(conn: ModbusConnection, unit: Int): Section {
+                  val rows = RegisterReader.readDefs(conn, unit, 3, defs).map {
+                      val c = it.num
+                      if (it.key == "St" && c != null) Reading(it.key, it.label, statusText(c.toInt()), c) else it
+                  }
+                  return Section("huawei", "Gerät $unit · Huawei SUN2000", rows)
+              }
+          }
+
+          /** GoodWe ET/EH/BT/BH (Hybrid), Registerbelegung wie in der Open-Source-Bibliothek "goodwe" (ET-Familie). */
+          object GoodWeProfile {
+              private val defs = listOf(
+                  RegDef("rated", "Nennleistung", 35001, "U16", 1.0, "W"),
+                  RegDef("sn", "Seriennummer", 35003, "STR", len = 8),
+                  RegDef("model", "Modell", 35011, "STR", len = 5),
+                  RegDef("vpv1", "PV1 Spannung", 35103, "U16", 0.1, "V"),
+                  RegDef("ipv1", "PV1 Strom", 35104, "U16", 0.1, "A"),
+                  RegDef("ppv1", "PV1 Leistung", 35105, "U32", 1.0, "W"),
+                  RegDef("vpv2", "PV2 Spannung", 35107, "U16", 0.1, "V"),
+                  RegDef("ipv2", "PV2 Strom", 35108, "U16", 0.1, "A"),
+                  RegDef("ppv2", "PV2 Leistung", 35109, "U32", 1.0, "W"),
+                  RegDef("vpv3", "PV3 Spannung", 35111, "U16", 0.1, "V"),
+                  RegDef("ipv3", "PV3 Strom", 35112, "U16", 0.1, "A"),
+                  RegDef("ppv3", "PV3 Leistung", 35113, "U32", 1.0, "W"),
+                  RegDef("vpv4", "PV4 Spannung", 35115, "U16", 0.1, "V"),
+                  RegDef("ipv4", "PV4 Strom", 35116, "U16", 0.1, "A"),
+                  RegDef("ppv4", "PV4 Leistung", 35117, "U32", 1.0, "W"),
+                  RegDef("vg1", "Netz L1 Spannung", 35121, "U16", 0.1, "V"),
+                  RegDef("ig1", "Netz L1 Strom", 35122, "U16", 0.1, "A"),
+                  RegDef("fg1", "Netz L1 Frequenz", 35123, "U16", 0.01, "Hz"),
+                  RegDef("pg1", "Netz L1 Leistung", 35125, "I16", 1.0, "W"),
+                  RegDef("vg2", "Netz L2 Spannung", 35126, "U16", 0.1, "V"),
+                  RegDef("ig2", "Netz L2 Strom", 35127, "U16", 0.1, "A"),
+                  RegDef("fg2", "Netz L2 Frequenz", 35128, "U16", 0.01, "Hz"),
+                  RegDef("pg2", "Netz L2 Leistung", 35130, "I16", 1.0, "W"),
+                  RegDef("vg3", "Netz L3 Spannung", 35131, "U16", 0.1, "V"),
+                  RegDef("ig3", "Netz L3 Strom", 35132, "U16", 0.1, "A"),
+                  RegDef("fg3", "Netz L3 Frequenz", 35133, "U16", 0.01, "Hz"),
+                  RegDef("pg3", "Netz L3 Leistung", 35135, "I16", 1.0, "W"),
+                  RegDef("inv_P", "Wechselrichter-Leistung gesamt", 35138, "I16", 1.0, "W"),
+                  RegDef("grid", "Netz-Wirkleistung (+ = Einspeisung)", 35140, "I16", 1.0, "W"),
+                  RegDef("bkp_P", "Notstrom-Last", 35170, "I16", 1.0, "W"),
+                  RegDef("load", "Hausverbrauch", 35172, "I16", 1.0, "W"),
+                  RegDef("t_air", "Temperatur (Luft)", 35174, "I16", 0.1, "°C"),
+                  RegDef("t_mod", "Temperatur (Modul)", 35175, "I16", 0.1, "°C"),
+                  RegDef("t_rad", "Temperatur (Kühlkörper)", 35176, "I16", 0.1, "°C"),
+                  RegDef("bat_V", "Batteriespannung", 35180, "U16", 0.1, "V"),
+                  RegDef("bat_I", "Batteriestrom", 35181, "I16", 0.1, "A"),
+                  RegDef("bat_P", "Batterieleistung (+ = entladen)", 35182, "I32", 1.0, "W"),
+                  RegDef("bat_mode", "Batteriemodus", 35184, "U16"),
+                  RegDef("St", "Betriebsmodus", 35187, "U16"),
+                  RegDef("err", "Fehlercodes", 35189, "U32"),
+                  RegDef("E_total", "PV-Ertrag gesamt", 35191, "U32", 0.1, "kWh"),
+                  RegDef("E_day", "PV-Ertrag heute", 35193, "U32", 0.1, "kWh"),
+                  RegDef("E_exp_total", "Einspeisung gesamt", 35195, "U32", 0.1, "kWh"),
+                  RegDef("h_total", "Betriebsstunden", 35197, "U32", 1.0, "h"),
+                  RegDef("E_exp_day", "Einspeisung heute", 35199, "U16", 0.1, "kWh"),
+                  RegDef("E_imp_total", "Netzbezug gesamt", 35200, "U32", 0.1, "kWh"),
+                  RegDef("E_imp_day", "Netzbezug heute", 35202, "U16", 0.1, "kWh"),
+                  RegDef("E_load_total", "Verbrauch gesamt", 35203, "U32", 0.1, "kWh"),
+                  RegDef("E_load_day", "Verbrauch heute", 35205, "U16", 0.1, "kWh"),
+                  RegDef("E_bchg_total", "Batterie geladen gesamt", 35206, "U32", 0.1, "kWh"),
+                  RegDef("E_bchg_day", "Batterie geladen heute", 35208, "U16", 0.1, "kWh"),
+                  RegDef("E_bdis_total", "Batterie entladen gesamt", 35209, "U32", 0.1, "kWh"),
+                  RegDef("E_bdis_day", "Batterie entladen heute", 35211, "U16", 0.1, "kWh"),
+                  RegDef("meter_P", "Zähler Wirkleistung gesamt", 36025, "I32", 1.0, "W"),
+                  RegDef("bat_T", "Batterietemperatur", 37003, "I16", 0.1, "°C"),
+                  RegDef("SOC", "Batterie Ladestand", 37007, "U16", 1.0, "%"),
+                  RegDef("SOH", "Batterie Gesundheit", 37008, "U16", 1.0, "%")
+              )
+
+              private fun workMode(c: Int): String = when (c) {
+                  0 -> "Wartend"
+                  1 -> "Netzbetrieb"
+                  2 -> "Inselbetrieb"
+                  3 -> "Fehler"
+                  4 -> "Firmware-Update"
+                  5 -> "Prüfung"
+                  else -> "Modus $c"
+              }
+
+              private fun batMode(c: Int): String = when (c) {
+                  0 -> "Keine Batterie"
+                  1 -> "Standby"
+                  2 -> "Entladen"
+                  3 -> "Laden"
+                  else -> "Modus $c"
+              }
+
+              fun read(conn: ModbusConnection, unit: Int): Section {
+                  val raw = RegisterReader.readDefs(conn, unit, 3, defs)
+                  val byKey = HashMap<String, Reading>()
+                  for (r in raw) byKey[r.key] = r
+
+                  val rows = ArrayList<Reading>()
+                  var sum = 0.0
+                  var any = false
+                  for (k in listOf("ppv1", "ppv2", "ppv3", "ppv4")) {
+                      val n = byKey[k]?.num
+                      if (n != null) {
+                          sum += n
+                          any = true
+                      }
+                  }
+                  if (any) rows.add(Reading("ppv", "PV-Leistung gesamt", fmtNum(sum) + " W", sum))
+
+                  for (r in raw) {
+                      val n = r.num
+                      if (r.key == "St" && n != null) {
+                          rows.add(Reading(r.key, r.label, workMode(n.toInt()), n))
+                      } else if (r.key == "bat_mode" && n != null) {
+                          rows.add(Reading(r.key, r.label, batMode(n.toInt()), n))
+                      } else {
+                          rows.add(r)
+                      }
+                  }
+                  return Section("goodwe", "Gerät $unit · GoodWe ET/EH/BT/BH", rows)
+              }
+          }
+          EOF
+          cat > proj/app/src/main/java/de/pvmodbus/app/Collector.kt <<'EOF'
+          package de.pvmodbus.app
+
+          import java.io.IOException
+          import java.net.SocketTimeoutException
+
+          data class Config(
+              val profile: Profile,
+              val host: String,
+              val port: Int,
+              val units: List<Int>,
+              val mAddr: Int,
+              val mInput: Boolean,
+              val mType: String,
+              val mScale: Double,
+              val mUnit: String,
+              val mSwap: Boolean
+          )
+
+          data class CollectResult(val sections: List<Section>, val errors: List<String>)
+
+          fun collect(sunspec: SunSpecReader, cfg: Config): CollectResult {
+              val sections = ArrayList<Section>()
+              val errors = ArrayList<String>()
+              try {
+                  ModbusConnection(cfg.host, cfg.port).use { conn ->
+                      for (u in cfg.units) {
+                          try {
+                              when (cfg.profile) {
+                                  Profile.SUNSPEC -> sections.addAll(sunspec.readAll(conn, u))
+                                  Profile.HUAWEI -> sections.add(HuaweiProfile.read(conn, u))
+                                  Profile.GOODWE -> sections.add(GoodWeProfile.read(conn, u))
+                                  Profile.MANUAL -> {
+                                      val def = RegDef("m", "Wert", cfg.mAddr, cfg.mType, cfg.mScale, cfg.mUnit)
+                                      val rows = RegisterReader.readDefs(conn, u, if (cfg.mInput) 4 else 3, listOf(def), cfg.mSwap)
+                                      sections.add(Section("manual", "Gerät $u · Register ${cfg.mAddr}", rows))
+                                  }
+                              }
+                          } catch (e: ModbusException) {
+                              errors.add("Unit $u: ${e.message}")
+                          } catch (e: IllegalStateException) {
+                              errors.add(e.message ?: "Unit $u: Fehler")
+                          }
+                      }
+                  }
+              } catch (e: SocketTimeoutException) {
+                  errors.add("Zeitüberschreitung – keine Antwort vom Gerät")
+              } catch (e: IOException) {
+                  errors.add(e.message ?: "Verbindungsfehler")
+              }
+              return CollectResult(sections, errors)
+          }
+
+          fun summaryOf(sections: List<Section>): List<Pair<String, String>> {
+              val inv = setOf("101", "102", "103", "111", "112", "113")
+              val meter = setOf("201", "202", "203", "204", "211", "212", "213", "214")
+              val hw = setOf("huawei")
+              val gw = setOf("goodwe")
+              val out = ArrayList<Pair<String, String>>()
+
+              findRow(sections, inv, "W")?.let { out.add("Leistung (AC)" to it.text) }
+              findRow(sections, hw, "P")?.let { out.add("Leistung (AC)" to it.text) }
+              findRow(sections, gw, "ppv")?.let { out.add("Leistung (PV)" to it.text) }
+              findRow(sections, inv, "St")?.let { out.add("Status" to it.text) }
+              findRow(sections, hw, "St")?.let { out.add("Status" to it.text) }
+              findRow(sections, gw, "St")?.let { out.add("Status" to it.text) }
+              findRow(sections, hw, "E_day")?.let { out.add("Tagesertrag" to it.text) }
+              findRow(sections, gw, "E_day")?.let { out.add("Tagesertrag" to it.text) }
+              findRow(sections, inv, "WH")?.let { out.add("Gesamtertrag" to it.text) }
+              findRow(sections, hw, "E_total")?.let { out.add("Gesamtertrag" to it.text) }
+              findRow(sections, gw, "E_total")?.let { out.add("Gesamtertrag" to it.text) }
+              findRow(sections, hw, "SOC")?.let { out.add("Batterie" to it.text) }
+              findRow(sections, gw, "SOC")?.let { out.add("Batterie" to it.text) }
+              findRow(sections, meter, "W")?.let { out.add("Zähler Wirkleistung" to it.text) }
+              findRow(sections, hw, "meter_P")?.let { out.add("Zähler Wirkleistung" to it.text) }
+              return out
+          }
+
+          fun exportText(sections: List<Section>): String {
+              val sb = StringBuilder()
+              for (s in sections) {
+                  sb.append(s.title).append('\n')
+                  for (r in s.rows) sb.append("  ").append(r.label).append(": ").append(r.text).append('\n')
+                  sb.append('\n')
+              }
+              return sb.toString()
+          }
+          EOF
+          cat > proj/app/src/main/java/de/pvmodbus/app/Live.kt <<'EOF'
+          package de.pvmodbus.app
+
+          /** Einheitliche Livewerte. Netz: + = Bezug. Batterie: + = laden. */
+          data class LiveData(
+              val pvW: Double?,
+              val loadW: Double?,
+              val gridImportW: Double?,
+              val batChargeW: Double?,
+              val soc: Double?,
+              val status: String?,
+              val eDay: String?,
+              val eTotal: String?
+          )
+
+          fun findRow(sections: List<Section>, ids: Set<String>, key: String): Reading? {
+              for (s in sections) {
+                  if (s.id in ids) {
+                      for (r in s.rows) {
+                          if (r.key == key) return r
+                      }
+                  }
+              }
+              return null
+          }
+
+          fun liveOf(sections: List<Section>, invertGrid: Boolean, invertBat: Boolean): LiveData {
+              val inv = setOf("101", "102", "103", "111", "112", "113")
+              val meter = setOf("201", "202", "203", "204", "211", "212", "213", "214")
+              val hw = setOf("huawei")
+              val gw = setOf("goodwe")
+
+              fun num(ids: Set<String>, key: String): Double? = findRow(sections, ids, key)?.num
+              fun txt(ids: Set<String>, key: String): String? = findRow(sections, ids, key)?.text
+
+              val pv: Double? = num(inv, "W") ?: num(hw, "P") ?: num(gw, "ppv")
+
+              var grid: Double? = null
+              val sunMeter = num(meter, "W")
+              val hwMeter = num(hw, "meter_P")
+              val gwGrid = num(gw, "grid")
+              if (sunMeter != null) grid = sunMeter
+              else if (hwMeter != null) grid = -hwMeter
+              else if (gwGrid != null) grid = -gwGrid
+              if (invertGrid && grid != null) grid = -grid
+
+              var bat: Double? = null
+              val hwBat = num(hw, "bat_P")
+              val gwBat = num(gw, "bat_P")
+              if (hwBat != null) bat = hwBat
+              else if (gwBat != null) bat = -gwBat
+              if (invertBat && bat != null) bat = -bat
+
+              var load: Double? = num(gw, "load")
+              if (load == null && pv != null && grid != null) {
+                  val l = pv + grid - (bat ?: 0.0)
+                  load = if (l < 0.0) 0.0 else l
+              }
+
+              val soc = num(hw, "SOC") ?: num(gw, "SOC")
+              val status = txt(inv, "St") ?: txt(hw, "St") ?: txt(gw, "St")
+              val eDay = txt(hw, "E_day") ?: txt(gw, "E_day")
+              val wh = num(inv, "WH")
+              val eTotal = if (wh != null) fmtNum(wh / 1000.0) + " kWh" else (txt(hw, "E_total") ?: txt(gw, "E_total"))
+
+              return LiveData(pv, load, grid, bat, soc, status, eDay, eTotal)
+          }
+          EOF
+          cat > proj/app/src/main/java/de/pvmodbus/app/HouseView.kt <<'EOF'
+          package de.pvmodbus.app
+
+          import androidx.compose.animation.core.LinearEasing
+          import androidx.compose.animation.core.RepeatMode
+          import androidx.compose.animation.core.animateFloat
+          import androidx.compose.animation.core.infiniteRepeatable
+          import androidx.compose.animation.core.rememberInfiniteTransition
+          import androidx.compose.animation.core.tween
+          import androidx.compose.foundation.Canvas
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.layout.Arrangement
+          import androidx.compose.foundation.layout.Box
+          import androidx.compose.foundation.layout.Column
+          import androidx.compose.foundation.layout.Row
+          import androidx.compose.foundation.layout.fillMaxWidth
+          import androidx.compose.foundation.layout.height
+          import androidx.compose.foundation.layout.offset
+          import androidx.compose.foundation.layout.padding
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material3.Text
+          import androidx.compose.runtime.Composable
+          import androidx.compose.runtime.getValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.geometry.CornerRadius
+          import androidx.compose.ui.geometry.Offset
+          import androidx.compose.ui.geometry.Size
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.Path
+          import androidx.compose.ui.graphics.drawscope.DrawScope
+          import androidx.compose.ui.graphics.drawscope.Stroke
+          import androidx.compose.ui.graphics.lerp
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import java.util.Locale
+
+          private fun kw(w: Double?): String =
+              if (w == null) "–" else String.format(Locale.GERMANY, "%.2f kW", w / 1000.0)
+
+          private fun DrawScope.flowDots(from: Offset, to: Offset, phase: Float, color: Color) {
+              val r = 4.dp.toPx()
+              for (i in 0 until 3) {
+                  val t = (phase + i / 3f) % 1f
+                  val p = Offset(from.x + (to.x - from.x) * t, from.y + (to.y - from.y) * t)
+                  drawCircle(color, radius = r, center = p)
+              }
+          }
+
+          @Composable
+          private fun Tile(title: String, value: String, sub: String, modifier: Modifier = Modifier) {
+              Column(
+                  modifier
+                      .clip(RoundedCornerShape(14.dp))
+                      .background(Color(0xFFF1F5F9))
+                      .padding(10.dp)
+              ) {
+                  Text(title, fontSize = 11.sp, color = Color(0xFF607D8B))
+                  Text(value, fontSize = 17.sp, fontWeight = FontWeight.Bold, color = Color(0xFF102A43))
+                  Text(sub, fontSize = 11.sp, color = Color(0xFF607D8B))
+              }
+          }
+
+          @Composable
+          fun HouseView(live: LiveData, kwp: Double) {
+              val transition = rememberInfiniteTransition(label = "flow")
+              val phase by transition.animateFloat(
+                  initialValue = 0f,
+                  targetValue = 1f,
+                  animationSpec = infiniteRepeatable(tween(1800, easing = LinearEasing), RepeatMode.Restart),
+                  label = "phase"
+              )
+
+              val pv = live.pvW ?: 0.0
+              val ratio = (pv / (kwp * 1000.0)).coerceIn(0.0, 1.0).toFloat()
+              val day = pv > 20.0
+              val grid = live.gridImportW ?: 0.0
+              val bat = live.batChargeW ?: 0.0
+              val soc = live.soc
+
+              Column(
+                  Modifier
+                      .fillMaxWidth()
+                      .clip(RoundedCornerShape(20.dp))
+                      .background(Color.White)
+              ) {
+                  Box(Modifier.fillMaxWidth().height(300.dp)) {
+                      Canvas(Modifier.matchParentSize()) {
+                          val w = size.width
+                          val h = size.height
+
+                          // Himmel
+                          val skyTop = if (day) Color(0xFF4FA3E8) else Color(0xFF16213E)
+                          val skyBottom = if (day) Color(0xFFBFE3FF) else Color(0xFF2A3A63)
+                          drawRect(Brush.verticalGradient(listOf(skyTop, skyBottom)))
+
+                          // Sonne bzw. Mond
+                          if (day) {
+                              drawCircle(Color(0x33FFD54F), radius = w * 0.13f * (1f + ratio * 0.3f), center = Offset(w * 0.14f, h * 0.16f))
+                              drawCircle(Color(0xFFFFD54F), radius = w * 0.065f, center = Offset(w * 0.14f, h * 0.16f))
+                          } else {
+                              drawCircle(Color(0xFFEFEFEF), radius = w * 0.04f, center = Offset(w * 0.14f, h * 0.16f))
+                          }
+
+                          // Wiese
+                          drawRect(
+                              if (day) Color(0xFF4C9A52) else Color(0xFF2E5B34),
+                              topLeft = Offset(0f, h * 0.85f),
+                              size = Size(w, h * 0.15f)
+                          )
+
+                          // Haus
+                          val hl = w * 0.30f
+                          val hr = w * 0.70f
+                          val ht = h * 0.50f
+                          val hb = h * 0.85f
+                          drawRect(Color(0xFFF3E9DC), topLeft = Offset(hl, ht), size = Size(hr - hl, hb - ht))
+                          drawRoundRect(
+                              Color(0xFF8D5A3B),
+                              topLeft = Offset(w * 0.47f, h * 0.71f),
+                              size = Size(w * 0.06f, h * 0.14f),
+                              cornerRadius = CornerRadius(6f, 6f)
+                          )
+                          val windowColor = if (day) Color(0xFFB7DFFB) else Color(0xFFFFE082)
+                          drawRect(windowColor, topLeft = Offset(w * 0.34f, h * 0.71f), size = Size(w * 0.09f, h * 0.08f))
+                          drawRect(windowColor, topLeft = Offset(w * 0.57f, h * 0.71f), size = Size(w * 0.09f, h * 0.08f))
+
+                          // Dach
+                          val apexX = w * 0.5f
+                          val apexY = h * 0.18f
+                          val eaveL = w * 0.21f
+                          val eaveR = w * 0.79f
+                          val roof = Path().apply {
+                              moveTo(apexX, apexY)
+                              lineTo(eaveR, ht)
+                              lineTo(eaveL, ht)
+                              close()
+                          }
+                          drawPath(roof, Color(0xFF8B3A3A))
+
+                          fun leftX(y: Float): Float = apexX - (apexX - eaveL) * (y - apexY) / (ht - apexY)
+                          fun rightX(y: Float): Float = apexX + (eaveR - apexX) * (y - apexY) / (ht - apexY)
+
+                          // Solarmodule auf dem Dach (2 Reihen x 4 Module), Farbe je nach Erzeugung
+                          val panelColor = if (day) {
+                              lerp(Color(0xFF1B3A6B), Color(0xFF2E9BFF), ratio)
+                          } else {
+                              Color(0xFF16294A)
+                          }
+                          val cols = 4
+                          val rowsY = listOf(h * 0.26f to h * 0.345f, h * 0.355f to h * 0.44f)
+                          val margin = w * 0.02f
+                          val gap = w * 0.006f
+                          for (rowY in rowsY) {
+                              val ya = rowY.first
+                              val yb = rowY.second
+                              val la = leftX(ya) + margin
+                              val ra = rightX(ya) - margin
+                              val lb = leftX(yb) + margin
+                              val rb = rightX(yb) - margin
+                              for (c in 0 until cols) {
+                                  val xa0 = la + (ra - la) * c / cols + gap
+                                  val xa1 = la + (ra - la) * (c + 1) / cols - gap
+                                  val xb0 = lb + (rb - lb) * c / cols + gap
+                                  val xb1 = lb + (rb - lb) * (c + 1) / cols - gap
+                                  val panel = Path().apply {
+                                      moveTo(xa0, ya)
+                                      lineTo(xa1, ya)
+                                      lineTo(xb1, yb)
+                                      lineTo(xb0, yb)
+                                      close()
+                                  }
+                                  drawPath(panel, panelColor)
+                                  drawPath(panel, Color(0x66FFFFFF), style = Stroke(width = 1.5f))
+                              }
+                          }
+
+                          // Strommast rechts
+                          val poleX = w * 0.90f
+                          drawLine(Color(0xFF6D4C41), Offset(poleX, h * 0.42f), Offset(poleX, hb), strokeWidth = 6f)
+                          drawLine(Color(0xFF6D4C41), Offset(poleX - w * 0.04f, h * 0.45f), Offset(poleX + w * 0.04f, h * 0.45f), strokeWidth = 5f)
+                          val poleTop = Offset(poleX - w * 0.04f, h * 0.45f)
+                          val houseWire = Offset(hr, h * 0.60f)
+                          drawLine(Color(0xFF455A64), poleTop, houseWire, strokeWidth = 3f)
+
+                          // Batterie links
+                          val bl = w * 0.06f
+                          val bw = w * 0.12f
+                          val bt = h * 0.62f
+                          val bh = h * 0.20f
+                          val batMid = Offset(bl + bw, bt + bh / 2f)
+                          val wallMid = Offset(hl, bt + bh / 2f)
+                          drawLine(Color(0xFF455A64), batMid, wallMid, strokeWidth = 3f)
+                          drawRoundRect(
+                              Color(0xFF37474F),
+                              topLeft = Offset(bl, bt),
+                              size = Size(bw, bh),
+                              cornerRadius = CornerRadius(8f, 8f)
+                          )
+                          drawRect(Color(0xFF37474F), topLeft = Offset(bl + bw * 0.35f, bt - 6f), size = Size(bw * 0.3f, 6f))
+                          if (soc != null) {
+                              val f = (soc / 100.0).coerceIn(0.0, 1.0).toFloat()
+                              val fillColor = if (soc > 30) Color(0xFF66BB6A) else if (soc > 15) Color(0xFFFFA726) else Color(0xFFEF5350)
+                              val inner = bh - 8f
+                              drawRoundRect(
+                                  fillColor,
+                                  topLeft = Offset(bl + 4f, bt + 4f + inner * (1f - f)),
+                                  size = Size(bw - 8f, inner * f),
+                                  cornerRadius = CornerRadius(5f, 5f)
+                              )
+                          }
+
+                          // Energiefluss
+                          if (pv > 30.0) {
+                              flowDots(Offset(w * 0.5f, h * 0.45f), Offset(w * 0.5f, h * 0.585f), phase, Color(0xFFFFD54F))
+                          }
+                          if (grid < -30.0) {
+                              flowDots(houseWire, poleTop, phase, Color(0xFF66BB6A))
+                          } else if (grid > 30.0) {
+                              flowDots(poleTop, houseWire, phase, Color(0xFFFF7043))
+                          }
+                          if (bat > 30.0) {
+                              flowDots(wallMid, batMid, phase, Color(0xFF42A5F5))
+                          } else if (bat < -30.0) {
+                              flowDots(batMid, wallMid, phase, Color(0xFF42A5F5))
+                          }
+                      }
+
+                      // Erzeugung (über dem Dach)
+                      Column(
+                          Modifier
+                              .align(Alignment.TopCenter)
+                              .padding(top = 8.dp)
+                              .clip(RoundedCornerShape(14.dp))
+                              .background(Color(0xCC102A43))
+                              .padding(horizontal = 14.dp, vertical = 5.dp),
+                          horizontalAlignment = Alignment.CenterHorizontally
+                      ) {
+                          Text("☀ PV-Erzeugung", fontSize = 11.sp, color = Color.White)
+                          Text(kw(live.pvW), fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Color(0xFFFFD54F))
+                      }
+
+                      // Verbrauch (im Haus)
+                      Column(
+                          Modifier
+                              .align(Alignment.Center)
+                              .offset(y = 47.dp)
+                              .clip(RoundedCornerShape(12.dp))
+                              .background(Color(0xE6FFFFFF))
+                              .padding(horizontal = 12.dp, vertical = 4.dp),
+                          horizontalAlignment = Alignment.CenterHorizontally
+                      ) {
+                          Text("Hausverbrauch", fontSize = 10.sp, color = Color(0xFF607D8B))
+                          Text(kw(live.loadW), fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Color(0xFF102A43))
+                      }
+
+                      // Status
+                      val st = live.status
+                      if (st != null) {
+                          Text(
+                              st,
+                              fontSize = 11.sp,
+                              color = Color.White,
+                              modifier = Modifier
+                                  .align(Alignment.TopEnd)
+                                  .padding(8.dp)
+                                  .clip(RoundedCornerShape(10.dp))
+                                  .background(Color(0x99000000))
+                                  .padding(horizontal = 8.dp, vertical = 3.dp)
+                          )
+                      }
+                  }
+
+                  Row(
+                      Modifier.fillMaxWidth().padding(10.dp),
+                      horizontalArrangement = Arrangement.spacedBy(8.dp)
+                  ) {
+                      val batValue = if (soc != null) String.format(Locale.GERMANY, "%.0f %%", soc) else "–"
+                      val batSub = if (live.batChargeW == null) "keine Daten"
+                      else if (bat > 30.0) "lädt " + kw(bat)
+                      else if (bat < -30.0) "entlädt " + kw(-bat)
+                      else "Ruhe"
+                      Tile("Batterie", batValue, batSub, Modifier.weight(1f))
+
+                      val gridValue = if (live.gridImportW == null) "–" else kw(Math.abs(grid))
+                      val gridSub = if (live.gridImportW == null) "keine Daten"
+                      else if (grid > 30.0) "Netzbezug"
+                      else if (grid < -30.0) "Einspeisung"
+                      else "ausgeglichen"
+                      Tile("Netz", gridValue, gridSub, Modifier.weight(1f))
+
+                      Tile("Ertrag heute", live.eDay ?: "–", "gesamt " + (live.eTotal ?: "–"), Modifier.weight(1f))
+                  }
+              }
+          }
+          EOF
+          cat > proj/app/src/main/java/de/pvmodbus/app/MainActivity.kt <<'EOF'
+          package de.pvmodbus.app
+
+          import android.content.Context
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.horizontalScroll
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.verticalScroll
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.platform.LocalClipboardManager
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.AnnotatedString
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.withContext
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      MaterialTheme(colorScheme = lightColorScheme()) {
+                          Surface(Modifier.fillMaxSize(), color = Color(0xFFE8EEF4)) { PvScreen() }
+                      }
+                  }
+              }
+          }
+
+          private val MANUAL_TYPES = listOf("U16", "I16", "U32", "I32", "F32")
+
+          @Composable
+          fun PvScreen() {
+              val ctx = LocalContext.current
+              val prefs = remember { ctx.getSharedPreferences("pv", Context.MODE_PRIVATE) }
+              val sunspec = remember { SunSpecReader(ctx.applicationContext) }
+              val clipboard = LocalClipboardManager.current
+
+              var profile by remember { mutableStateOf(Profile.fromName(prefs.getString("profile", "") ?: "")) }
+              var host by remember { mutableStateOf(prefs.getString("host", "192.168.1.100") ?: "192.168.1.100") }
+              var port by remember { mutableStateOf(prefs.getString("port", "502") ?: "502") }
+              var units by remember { mutableStateOf(prefs.getString("units", "1") ?: "1") }
+              var interval by remember { mutableStateOf(prefs.getString("interval", "5") ?: "5") }
+              var kwp by remember { mutableStateOf(prefs.getString("kwp", "10") ?: "10") }
+              var invGrid by remember { mutableStateOf(prefs.getBoolean("invGrid", false)) }
+              var invBat by remember { mutableStateOf(prefs.getBoolean("invBat", false)) }
+
+              var mAddr by remember { mutableStateOf("0") }
+              var mInput by remember { mutableStateOf(false) }
+              var mType by remember { mutableStateOf("U16") }
+              var mScale by remember { mutableStateOf("1") }
+              var mUnit by remember { mutableStateOf("") }
+              var mSwap by remember { mutableStateOf(false) }
+
+              var polling by remember { mutableStateOf(false) }
+              var showSettings by remember { mutableStateOf(true) }
+              var sections by remember { mutableStateOf<List<Section>>(emptyList()) }
+              var errors by remember { mutableStateOf<List<String>>(emptyList()) }
+              var updated by remember { mutableStateOf("") }
+              val expanded = remember { mutableStateMapOf<String, Boolean>() }
+
+              LaunchedEffect(polling) {
+                  while (polling) {
+                      val cfg = Config(
+                          profile = profile,
+                          host = host.trim(),
+                          port = port.trim().toIntOrNull() ?: 502,
+                          units = units.split(',', ';', ' ').mapNotNull { it.trim().toIntOrNull() }.ifEmpty { listOf(1) },
+                          mAddr = mAddr.trim().toIntOrNull() ?: 0,
+                          mInput = mInput,
+                          mType = mType,
+                          mScale = mScale.trim().replace(',', '.').toDoubleOrNull() ?: 1.0,
+                          mUnit = mUnit.trim(),
+                          mSwap = mSwap
+                      )
+                      val res = withContext(Dispatchers.IO) {
+                          try {
+                              collect(sunspec, cfg)
+                          } catch (e: Exception) {
+                              CollectResult(emptyList(), listOf(e.message ?: e.javaClass.simpleName))
+                          }
+                      }
+                      if (res.sections.isNotEmpty()) {
+                          sections = res.sections
+                          updated = SimpleDateFormat("HH:mm:ss", Locale.GERMANY).format(Date())
+                      }
+                      errors = res.errors
+                      delay((interval.trim().toLongOrNull() ?: 5L).coerceAtLeast(1L) * 1000L)
+                  }
+              }
+
+              Column(
+                  Modifier.fillMaxSize().verticalScroll(rememberScrollState()).statusBarsPadding().padding(12.dp),
+                  verticalArrangement = Arrangement.spacedBy(10.dp)
+              ) {
+                  Row(
+                      Modifier.fillMaxWidth(),
+                      horizontalArrangement = Arrangement.SpaceBetween,
+                      verticalAlignment = Alignment.CenterVertically
+                  ) {
+                      Column {
+                          Text("PV-Monitor", fontSize = 22.sp)
+                          Text(
+                              if (polling) "live" + (if (updated.isNotEmpty()) " · $updated" else "") else "gestoppt",
+                              fontSize = 12.sp,
+                              color = if (polling) Color(0xFF2E7D32) else Color(0xFF607D8B)
+                          )
+                      }
+                      Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                          OutlinedButton(onClick = { showSettings = !showSettings }) {
+                              Text(if (showSettings) "Zuklappen" else "Einstellungen")
+                          }
+                          Button(onClick = {
+                              if (!polling) {
+                                  prefs.edit()
+                                      .putString("profile", profile.name)
+                                      .putString("host", host)
+                                      .putString("port", port)
+                                      .putString("units", units)
+                                      .putString("interval", interval)
+                                      .putString("kwp", kwp)
+                                      .putBoolean("invGrid", invGrid)
+                                      .putBoolean("invBat", invBat)
+                                      .apply()
+                                  showSettings = false
+                              }
+                              polling = !polling
+                          }) { Text(if (polling) "Stopp" else "Start") }
+                      }
+                  }
+
+                  errors.forEach { Text("Fehler: $it", color = MaterialTheme.colorScheme.error, fontSize = 13.sp) }
+
+                  val live = liveOf(sections, invGrid, invBat)
+                  HouseView(live, kwp.trim().replace(',', '.').toDoubleOrNull()?.coerceAtLeast(0.1) ?: 10.0)
+
+                  if (showSettings) {
+                      Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                          Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                              Row(
+                                  Modifier.horizontalScroll(rememberScrollState()),
+                                  horizontalArrangement = Arrangement.spacedBy(6.dp)
+                              ) {
+                                  Profile.values().forEach { p ->
+                                      FilterChip(
+                                          selected = profile == p,
+                                          onClick = {
+                                              profile = p
+                                              port = p.defPort
+                                              units = p.defUnit
+                                          },
+                                          label = { Text(p.short) }
+                                      )
+                                  }
+                              }
+                              Text(profile.title, fontSize = 15.sp)
+                              Text(profile.hint, fontSize = 12.sp, color = Color(0xFF607D8B))
+
+                              OutlinedTextField(
+                                  host, { host = it }, label = { Text("IP-Adresse") },
+                                  singleLine = true, modifier = Modifier.fillMaxWidth()
+                              )
+                              Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                  OutlinedTextField(port, { port = it }, label = { Text("Port") }, singleLine = true, modifier = Modifier.weight(1f))
+                                  OutlinedTextField(units, { units = it }, label = { Text("Unit-ID(s)") }, singleLine = true, modifier = Modifier.weight(1f))
+                                  OutlinedTextField(interval, { interval = it }, label = { Text("Takt (s)") }, singleLine = true, modifier = Modifier.weight(1f))
+                              }
+                              OutlinedTextField(
+                                  kwp, { kwp = it }, label = { Text("Anlagenleistung (kWp, für die Dach-Anzeige)") },
+                                  singleLine = true, modifier = Modifier.fillMaxWidth()
+                              )
+                              Row(verticalAlignment = Alignment.CenterVertically) {
+                                  Switch(invGrid, { invGrid = it })
+                                  Text("  Netz-Vorzeichen umkehren", fontSize = 13.sp)
+                              }
+                              Row(verticalAlignment = Alignment.CenterVertically) {
+                                  Switch(invBat, { invBat = it })
+                                  Text("  Batterie-Vorzeichen umkehren", fontSize = 13.sp)
+                              }
+
+                              if (profile == Profile.MANUAL) {
+                                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                      OutlinedTextField(mAddr, { mAddr = it }, label = { Text("Adresse") }, singleLine = true, modifier = Modifier.weight(1f))
+                                      OutlinedTextField(mScale, { mScale = it }, label = { Text("Faktor") }, singleLine = true, modifier = Modifier.weight(1f))
+                                      OutlinedTextField(mUnit, { mUnit = it }, label = { Text("Einheit") }, singleLine = true, modifier = Modifier.weight(1f))
+                                  }
+                                  Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                      MANUAL_TYPES.forEach { t ->
+                                          FilterChip(selected = mType == t, onClick = { mType = t }, label = { Text(t) })
+                                      }
+                                  }
+                                  Row(verticalAlignment = Alignment.CenterVertically) {
+                                      Checkbox(mInput, { mInput = it })
+                                      Text("Input Register (FC 4) statt Holding (FC 3)", fontSize = 13.sp)
+                                  }
+                                  Row(verticalAlignment = Alignment.CenterVertically) {
+                                      Checkbox(mSwap, { mSwap = it })
+                                      Text("Wortreihenfolge tauschen (32 Bit)", fontSize = 13.sp)
+                                  }
+                              }
+                          }
+                      }
+                  }
+
+                  val summary = summaryOf(sections)
+                  if (summary.isNotEmpty()) {
+                      Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                          Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                              Text("Übersicht", fontSize = 14.sp, color = Color(0xFF607D8B))
+                              summary.forEach { item ->
+                                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                      Text(item.first, fontSize = 15.sp)
+                                      Text(item.second, fontSize = 18.sp)
+                                  }
+                              }
+                          }
+                      }
+                  }
+
+                  if (sections.isNotEmpty()) {
+                      Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                          Text("Alle Werte", fontSize = 16.sp)
+                          OutlinedButton(onClick = { clipboard.setText(AnnotatedString(exportText(sections))) }) {
+                              Text("Alles kopieren")
+                          }
+                      }
+                  }
+
+                  sections.forEach { s ->
+                      val open = expanded[s.title] == true
+                      Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color.White)) {
+                          Column(Modifier.padding(12.dp)) {
+                              Text(
+                                  (if (open) "▾ " else "▸ ") + s.title + " (" + s.rows.size + ")",
+                                  modifier = Modifier.fillMaxWidth().clickable { expanded[s.title] = !open }
+                              )
+                              if (open) {
+                                  s.rows.forEach { r ->
+                                      Row(Modifier.fillMaxWidth().padding(top = 4.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                                          Text(r.label, modifier = Modifier.weight(1f), fontSize = 13.sp)
+                                          Text(r.text, fontSize = 13.sp)
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  Spacer(Modifier.height(24.dp))
+              }
+          }
+          EOF
+      - name: SunSpec-Modelle laden
+        run: |
+          git clone --depth 1 https://github.com/sunspec/models.git sunspec-models
+          mkdir -p proj/app/src/main/assets/models
+          find sunspec-models -type f -name 'model_*.json' -exec cp {} proj/app/src/main/assets/models/ \;
+          ls proj/app/src/main/assets/models | wc -l
+          test -f proj/app/src/main/assets/models/model_103.json
+      - name: APK bauen
+        run: cd proj && gradle assembleDebug --no-daemon
+      - name: Release mit APK erstellen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "apk-${{ github.run_number }}" proj/app/build/outputs/apk/debug/app-debug.apk --title "PV Monitor APK ${{ github.run_number }}" --notes "Debug-APK"
